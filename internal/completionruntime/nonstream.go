@@ -52,6 +52,13 @@ func StartCompletion(ctx context.Context, ds DeepSeekCaller, a *auth.RequestAuth
 	if maxAttempts <= 0 {
 		maxAttempts = 3
 	}
+
+	// ═══ 手动模式：完全绕过 DeepSeek 自动客户端 ═══
+	if isManualMode() {
+		return manualModeStart(ctx, stdReq)
+	}
+	// ═══ 正常模式 ═══
+
 	var prepErr *assistantturn.OutputError
 	stdReq, prepErr = prepareCurrentInputFile(ctx, ds, a, stdReq, opts)
 	if prepErr != nil {
