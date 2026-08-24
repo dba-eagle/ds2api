@@ -1,0 +1,421 @@
+// ==UserScript==
+// @name         DS2API 大模型桥接（轮次标识版）
+// @namespace    ds2api
+// @version      2.8
+// @description  自动监控 prompt，显示轮次/时间/NEW标记，复制到剪贴板；回复独立输入框回灌
+// @author       You
+// @match        https://kimi.moonshot.cn/*
+// @match        https://kimi.ai/*
+// @match        https://www.kimi.ai/*
+// @match        https://kimi.com/*
+// @match        https://www.kimi.com/*
+// @match        https://chat.deepseek.com/*
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @match        https://claude.ai/*
+// @match        https://poe.com/*
+// @match        https://gemini.google.com/*
+// @match        https://aistudio.google.com/*
+// @match        https://yuanbao.tencent.com/*
+// @match        https://tongyi.aliyun.com/*
+// @match        https://www.qianwen.com/*
+// @grant        GM_xmlhttpRequest
+// @connect      localhost
+// @connect      127.0.0.1
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const RECEIVER_URL = 'http://127.0.0.1:6012/receive';
+    const PROMPT_URL   = 'http://127.0.0.1:6012/prompt';
+    const TEST_URL     = 'http://127.0.0.1:6012/';
+
+    const PLATFORM = (() => {
+        const h = location.hostname;
+        if (h.includes('kimi')) return 'kimi';
+        if (h.includes('deepseek')) return 'deepseek';
+        if (h.includes('chatgpt') || h.includes('openai')) return 'chatgpt';
+        if (h.includes('claude')) return 'claude';
+        if (h.includes('poe')) return 'poe';
+        if (h.includes('gemini') || h.includes('google')) return 'gemini';
+        if (h.includes('yuanbao')) return 'yuanbao';
+        if (h.includes('tongyi') || h.includes('qianwen')) return 'qianwen';
+        return 'unknown';
+    })();
+
+    let lastPromptHash = '';
+    let autoMonitorInterval = null;
+    let isMonitoring = true;
+    let requestCounter = 0;   // 轮次计数器
+    let lastCaptureTime = ''; // 上次捕获时间
+
+    function hash(str) {
+        let h = 0;
+        for (let i = 0; i < str.length; i++) {
+            h = ((h << 5) - h) + str.charCodeAt(i);
+            h |= 0;
+        }
+        return h;
+    }
+
+    function formatTime() {
+        const d = new Date();
+        return `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}:${d.getSeconds().toString().padStart(2,'0')}`;
+    }
+
+    function ensureBody(callback, retries = 50) {
+        if (document.body) { callback(); return; }
+        if (retries <= 0) return;
+        setTimeout(() => ensureBody(callback, retries - 1), 100);
+    }
+
+    function createPanel() {
+        const old = document.getElementById('ds2api-bridge-panel');
+        if (old) old.remove();
+
+        const panel = document.createElement('div');
+        panel.id = 'ds2api-bridge-panel';
+        panel.style.cssText = `
+            position: fixed; top: 16px; right: 16px; z-index: 2147483647;
+            width: 400px; background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+            color: #c9d1d9; border: 1px solid #30363d; border-radius: 14px;
+            padding: 16px; font-family: system-ui, sans-serif; font-size: 13px;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.6); line-height: 1.5;
+        `;
+
+        panel.innerHTML = `
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+                <div style="font-weight:800; color:#58a6ff; font-size:15px;">🔌 DS2API 桥接</div>
+                <div style="display:flex; align-items:center; gap:6px;">
+                    <span id="ds2api-monitor-badge" style="background:#238636; color:#fff; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600;">🟢 监控中</span>
+                    <span style="background:#484f58; color:#fff; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600;">${PLATFORM}</span>
+                </div>
+            </div>
+
+            <div id="ds2api-env-banner" style="margin-bottom:10px; padding:8px 12px; background:#21262d; border:1px solid #30363d; border-radius:8px; font-size:12px; color:#8b949e; transition:all 0.3s;">
+                ⏳ 初始化...
+            </div>
+
+            <div style="margin-bottom:10px; display:flex; gap:6px;">
+                <button id="ds2api-test" style="flex:1; padding:7px; background:#1f6feb; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; font-size:12px;">🔗 测试</button>
+                <button id="ds2api-prompt" style="flex:1; padding:7px; background:#a371f7; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; font-size:12px;">📋 手动提取</button>
+                <button id="ds2api-toggle" style="flex:1; padding:7px; background:#21262d; color:#8b949e; border:1px solid #30363d; border-radius:8px; cursor:pointer; font-weight:600; font-size:12px;">⏸️ 暂停</button>
+            </div>
+
+            <!-- 上下文显示区 -->
+            <div style="margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
+                <div style="display:flex; align-items:center; gap:6px;">
+                    <span style="font-size:11px; color:#8b949e;">📥 上下文</span>
+                    <span id="ds2api-req-badge" style="display:none; background:#238636; color:#fff; padding:1px 6px; border-radius:10px; font-size:10px; font-weight:700;">NEW</span>
+                </div>
+                <span id="ds2api-prompt-meta" style="font-size:11px; color:#484f58;">等待中...</span>
+            </div>
+            <textarea id="ds2api-prompt-box" readonly placeholder="等待 ds2api 捕获请求..."
+                style="width:100%; height:80px; background:#0a0e14; color:#7ee787; border:1px solid #30363d; border-radius:8px; padding:10px; font-size:12px; resize:none; box-sizing:border-box; outline:none; line-height:1.5; cursor:default; opacity:0.9; transition:border-color 0.3s, box-shadow 0.3s;"></textarea>
+
+            <!-- 回复粘贴区 -->
+            <div style="margin-top:10px; margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:11px; color:#8b949e;">📤 回复（手动粘贴 AI 回复后回灌）</span>
+                <span id="ds2api-reply-count" style="font-size:11px; color:#484f58;">0 字符</span>
+            </div>
+            <textarea id="ds2api-reply-box" placeholder="1. 等 AI 生成完回复&#10;2. 手动复制回复内容&#10;3. 粘贴到这里&#10;4. 点击「回灌」"
+                style="width:100%; height:110px; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; padding:10px; font-size:12px; resize:vertical; box-sizing:border-box; outline:none; line-height:1.5;"></textarea>
+
+            <div style="display:flex; gap:8px; margin-top:10px;">
+                <button id="ds2api-send" style="flex:2; padding:10px; background:#2ea043; color:#fff; border:none; border-radius:10px; cursor:pointer; font-weight:700; font-size:14px; box-shadow:0 2px 8px rgba(46,160,67,0.3);">🚀 回灌到 ds2api</button>
+                <button id="ds2api-clear-reply" style="flex:1; padding:10px; background:#21262d; color:#8b949e; border:1px solid #30363d; border-radius:10px; cursor:pointer; font-weight:600; font-size:13px;">🗑️ 清空回复</button>
+            </div>
+
+            <div id="ds2api-status" style="margin-top:8px; font-size:12px; color:#8b949e; min-height:18px;">等待操作...</div>
+        `;
+
+        document.body.appendChild(panel);
+        bindEvents();
+    }
+
+    function setBanner(html, type) {
+        const el = document.getElementById('ds2api-env-banner');
+        if (!el) return;
+        el.innerHTML = html;
+        const styles = {
+            info:    { bg: '#21262d', border: '#30363d', text: '#8b949e' },
+            success: { bg: '#0f3d0f', border: '#238636', text: '#3fb950' },
+            error:   { bg: '#3d0f0f', border: '#f85149', text: '#f85149' },
+            warn:    { bg: '#3d300f', border: '#d29922', text: '#d29922' },
+            active:  { bg: '#2d0f3d', border: '#a371f7', text: '#bc8cff' }
+        };
+        const s = styles[type] || styles.info;
+        el.style.background = s.bg;
+        el.style.borderColor = s.border;
+        el.style.color = s.text;
+    }
+
+    function setStatus(msg, type) {
+        const el = document.getElementById('ds2api-status');
+        if (!el) return;
+        const colors = { info: '#8b949e', success: '#3fb950', error: '#f85149', warn: '#d29922', active: '#bc8cff' };
+        el.style.color = colors[type] || colors.info;
+        el.textContent = msg;
+    }
+
+    function updateMonitorBadge() {
+        const badge = document.getElementById('ds2api-monitor-badge');
+        if (!badge) return;
+        if (isMonitoring) {
+            badge.textContent = '🟢 监控中';
+            badge.style.background = '#238636';
+        } else {
+            badge.textContent = '⏸️ 已暂停';
+            badge.style.background = '#484f58';
+        }
+    }
+
+    function updatePromptMeta() {
+        const meta = document.getElementById('ds2api-prompt-meta');
+        if (!meta) return;
+        if (requestCounter === 0) {
+            meta.textContent = '等待中...';
+            meta.style.color = '#484f58';
+        } else {
+            meta.innerHTML = `<span style="color:#58a6ff; font-weight:700;">第 ${requestCounter} 轮</span> <span style="color:#6e7681;">|</span> ${lastCaptureTime} <span style="color:#6e7681;">|</span> <span id="ds2api-prompt-char-count" style="color:#484f58;">0 字符</span>`;
+            meta.style.color = '#8b949e';
+        }
+    }
+
+    function updatePromptCharCount(len) {
+        const el = document.getElementById('ds2api-prompt-char-count');
+        if (el) el.textContent = `${len} 字符`;
+    }
+
+    function showNewBadge() {
+        const badge = document.getElementById('ds2api-req-badge');
+        if (!badge) return;
+        badge.style.display = 'inline-block';
+        let flashes = 0;
+        const interval = setInterval(() => {
+            badge.style.opacity = flashes % 2 === 0 ? '1' : '0.3';
+            flashes++;
+            if (flashes >= 6) {
+                clearInterval(interval);
+                badge.style.opacity = '1';
+                setTimeout(() => { badge.style.display = 'none'; }, 3000);
+            }
+        }, 400);
+    }
+
+    function flashPromptBox() {
+        const box = document.getElementById('ds2api-prompt-box');
+        if (!box) return;
+        box.style.borderColor = '#2ea043';
+        box.style.boxShadow = '0 0 16px #2ea04360';
+        setTimeout(() => { box.style.borderColor = '#30363d'; box.style.boxShadow = 'none'; }, 1500);
+    }
+
+    // 双保险复制
+    async function copyToClipboard(text) {
+        let ok = false;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+        }
+        if (!ok) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.cssText = 'position:fixed;opacity:0;left:-9999px;';
+            document.body.appendChild(ta);
+            ta.focus(); ta.select();
+            try { ok = document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta);
+            window.getSelection().removeAllRanges();
+        }
+        return ok;
+    }
+
+    // ========== 核心：自动监控 prompt 更新 ==========
+    function checkPromptUpdate() {
+        if (!isMonitoring) return;
+        GM_xmlhttpRequest({
+            method: 'GET', url: PROMPT_URL, timeout: 3000,
+            onload: function(res) {
+                if (res.status !== 200) return;
+                const text = res.responseText;
+                if (!text || text.length < 10) return;
+
+                const h = hash(text);
+                if (h === lastPromptHash) return; // 没变，跳过
+
+                // === 新请求 detected ===
+                lastPromptHash = h;
+                requestCounter++;
+                lastCaptureTime = formatTime();
+
+                const box = document.getElementById('ds2api-prompt-box');
+                box.value = text;
+                updatePromptMeta();
+                updatePromptCharCount(text.length);
+                showNewBadge();
+                flashPromptBox();
+
+                copyToClipboard(text).then(copied => {
+                    if (copied) {
+                        setBanner(`🟢 <b>第 ${requestCounter} 轮新上下文已自动获取并复制！</b> 直接粘贴发送`, 'success');
+                        setStatus(`✅ 第 ${requestCounter} 轮 | ${text.length} 字符 | 已复制到剪贴板 | ${lastCaptureTime}`, 'success');
+                    } else {
+                        setBanner(`🟡 <b>第 ${requestCounter} 轮新上下文已获取！</b> 浏览器阻止自动复制，请手动选中绿框按 Ctrl+C`, 'warn');
+                        setStatus(`⚠️ 第 ${requestCounter} 轮 | ${text.length} 字符 | 请手动复制 | ${lastCaptureTime}`, 'warn');
+                    }
+                });
+            },
+            onerror: function() {},
+            ontimeout: function() {}
+        });
+    }
+
+    function startAutoMonitor() {
+        if (autoMonitorInterval) clearInterval(autoMonitorInterval);
+        autoMonitorInterval = setInterval(checkPromptUpdate, 2000);
+        isMonitoring = true;
+        updateMonitorBadge();
+        setStatus('⏳ 自动监控已启动，等待 ds2api 新请求...', 'info');
+    }
+
+    function stopAutoMonitor() {
+        if (autoMonitorInterval) {
+            clearInterval(autoMonitorInterval);
+            autoMonitorInterval = null;
+        }
+        isMonitoring = false;
+        updateMonitorBadge();
+        setStatus('⏸️ 自动监控已暂停', 'warn');
+    }
+
+    function toggleMonitor() {
+        if (isMonitoring) stopAutoMonitor();
+        else startAutoMonitor();
+    }
+
+    function testConnection() {
+        setStatus('⏳ 测试中...', 'warn');
+        setBanner('⏳ 测试连接...', 'warn');
+        GM_xmlhttpRequest({
+            method: 'GET', url: TEST_URL, timeout: 3000,
+            onload: function(res) {
+                if (res.status === 200 || res.status === 404) {
+                    setStatus('✅ 接收端在线', 'success');
+                    setBanner('✅ 环境正常，自动监控运行中', 'success');
+                } else {
+                    setStatus(`⚠️ HTTP ${res.status}`, 'warn');
+                }
+            },
+            onerror: function() {
+                setStatus('❌ 离线', 'error');
+                setBanner('❌ 请确认 ds2api 已启动', 'error');
+            },
+            ontimeout: function() { setStatus('⏱️ 超时', 'error'); }
+        });
+    }
+
+    function manualFetchPrompt() {
+        setStatus('⏳ 手动获取中...', 'active');
+        setBanner('⏳ 手动获取 prompt...', 'active');
+        GM_xmlhttpRequest({
+            method: 'GET', url: PROMPT_URL, timeout: 5000,
+            onload: function(res) {
+                const box = document.getElementById('ds2api-prompt-box');
+                if (res.status === 200) {
+                    const text = res.responseText;
+                    const h = hash(text);
+                    const isNew = h !== lastPromptHash;
+                    if (isNew) {
+                        lastPromptHash = h;
+                        requestCounter++;
+                        lastCaptureTime = formatTime();
+                    }
+                    box.value = text;
+                    updatePromptMeta();
+                    updatePromptCharCount(text.length);
+                    if (isNew) { showNewBadge(); flashPromptBox(); }
+
+                    copyToClipboard(text).then(copied => {
+                        if (copied) {
+                            setBanner(`✅ 第 ${requestCounter} 轮已获取并复制！`, 'success');
+                            setStatus(`✅ 第 ${requestCounter} 轮 | ${text.length} 字符已复制 | ${lastCaptureTime}`, 'success');
+                        } else {
+                            setBanner(`🟡 第 ${requestCounter} 轮已获取！请手动复制`, 'warn');
+                            setStatus(`⚠️ 第 ${requestCounter} 轮 | ${text.length} 字符 | 请手动复制`, 'warn');
+                        }
+                    });
+                } else if (res.status === 404) {
+                    box.value = '';
+                    requestCounter = 0;
+                    lastPromptHash = '';
+                    updatePromptMeta();
+                    setBanner('⚠️ 暂无待处理请求', 'warn');
+                    setStatus('⚠️ ds2api 尚未捕获请求', 'warn');
+                } else {
+                    setBanner(`❌ HTTP ${res.status}`, 'error');
+                }
+            },
+            onerror: function() {
+                setBanner('❌ 无法连接', 'error');
+                setStatus('❌ 无法连接接收端', 'error');
+            },
+            ontimeout: function() { setStatus('⏱️ 超时', 'error'); }
+        });
+    }
+
+    function sendToDS2API() {
+        const box = document.getElementById('ds2api-reply-box');
+        const text = box.value.trim();
+        if (!text) { setStatus('❌ 回复内容为空', 'error'); return; }
+        if (text.length < 5) { setStatus('❌ 回复内容太短', 'error'); return; }
+
+        setStatus('⏳ 回灌中...', 'active');
+        GM_xmlhttpRequest({
+            method: 'POST', url: RECEIVER_URL,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+            data: text, timeout: 5000,
+            onload: function(res) {
+                if (res.status === 200) {
+                    setStatus(`✅ 第 ${requestCounter} 轮回灌成功！${text.length} 字符`, 'success');
+                    box.value = '';
+                    document.getElementById('ds2api-reply-count').textContent = '0 字符';
+                } else {
+                    setStatus(`❌ 回灌失败: HTTP ${res.status}`, 'error');
+                }
+            },
+            onerror: function() { setStatus('❌ 连接失败', 'error'); },
+            ontimeout: function() { setStatus('⏱️ 超时', 'error'); }
+        });
+    }
+
+    function bindEvents() {
+        document.getElementById('ds2api-test')?.addEventListener('click', testConnection);
+        document.getElementById('ds2api-prompt')?.addEventListener('click', manualFetchPrompt);
+        document.getElementById('ds2api-toggle')?.addEventListener('click', toggleMonitor);
+        document.getElementById('ds2api-send')?.addEventListener('click', sendToDS2API);
+        document.getElementById('ds2api-clear-reply')?.addEventListener('click', () => {
+            document.getElementById('ds2api-reply-box').value = '';
+            document.getElementById('ds2api-reply-count').textContent = '0 字符';
+            setStatus('回复区已清空', 'info');
+        });
+        document.getElementById('ds2api-reply-box')?.addEventListener('input', function() {
+            document.getElementById('ds2api-reply-count').textContent = `${this.value.length} 字符`;
+        });
+    }
+
+    function init() {
+        ensureBody(() => {
+            createPanel();
+            testConnection();
+            startAutoMonitor();
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();

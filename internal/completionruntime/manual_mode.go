@@ -28,16 +28,126 @@ var (
 	// 请求计数器，用于日志标识
 	manualRequestCounter int
 	counterMutex         sync.Mutex
+
+	// 桥接接收端只启动一次
+	bridgeServerOnce sync.Once
 )
 
 func isManualMode() bool {
 	return os.Getenv("DS2API_MANUAL_MODE") == "true"
 }
 
+// startBridgeReceiver 启动本地 HTTP 接收端（供油猴脚本直接 POST 回复 / GET 获取 prompt）
+// 只在第一次进入手动模式时启动，地址默认 127.0.0.1:6012
+func startBridgeReceiver() {
+	mux := http.NewServeMux()
+
+	// 根路径：供油猴"测试连接"使用
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == "GET" {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("DS2API Bridge Receiver OK"))
+			return
+		}
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	})
+
+	// 新增：获取当前 prompt.txt 内容（供油猴"提取上下文"使用）
+	mux.HandleFunc("/prompt", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method != "GET" {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		data, err := os.ReadFile(manualPromptFile)
+		if err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "no active prompt", http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write(data)
+	})
+
+	// 接收端：油猴 POST 回复内容到这里
+	mux.HandleFunc("/receive", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method != "POST" {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		if len(body) == 0 {
+			http.Error(w, "empty body", http.StatusBadRequest)
+			return
+		}
+
+		if err := os.MkdirAll(manualWorkDir, 0755); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if err := os.WriteFile(manualResponseFile, body, 0644); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		config.Logger.Info(fmt.Sprintf("[MANUAL_MODE] 桥接接收端收到回复 (%d 字节)，已写入 %s", len(body), manualResponseFile))
+		w.Write([]byte("OK"))
+	})
+
+	// 地址可通过环境变量覆盖，默认 6012（与油猴脚本保持一致）
+	addr := os.Getenv("DS2API_BRIDGE_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:6012"
+	}
+
+	go func() {
+		config.Logger.Info(fmt.Sprintf("[MANUAL_MODE] 桥接接收端启动于 http://%s", addr))
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			config.Logger.Error(fmt.Sprintf("[MANUAL_MODE] 桥接接收端异常: %v", err))
+		}
+	}()
+}
+
+func setCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
 func manualModeStart(ctx context.Context, stdReq promptcompat.StandardRequest) (StartResult, *assistantturn.OutputError) {
 	// 串行化：一次只处理一个手动请求，其他请求在这里排队
 	manualModeMutex.Lock()
 	defer manualModeMutex.Unlock()
+
+	// 第一次进入手动模式时，启动桥接接收端
+	bridgeServerOnce.Do(startBridgeReceiver)
 
 	counterMutex.Lock()
 	manualRequestCounter++
@@ -104,6 +214,7 @@ func manualModeOutputRequest(reqNum int, payload map[string]any, prompt string) 
 	config.Logger.Info(fmt.Sprintf("[MANUAL_MODE #%d]   2. 复制到网页端发送", reqNum))
 	config.Logger.Info(fmt.Sprintf("[MANUAL_MODE #%d]   3. 复制网页端回复", reqNum))
 	config.Logger.Info(fmt.Sprintf("[MANUAL_MODE #%d]   4. 回灌：cat > %s  （粘贴后按Ctrl+D）", reqNum, manualResponseFile))
+	config.Logger.Info(fmt.Sprintf("[MANUAL_MODE #%d]   或点击油猴面板「🚀 回灌到 ds2api」自动写入", reqNum))
 	config.Logger.Info(fmt.Sprintf("[MANUAL_MODE #%d] 服务正在轮询等待...", reqNum))
 	config.Logger.Info(fmt.Sprintf("[MANUAL_MODE #%d] ════════════════════════════════════════════════════", reqNum))
 	return nil
