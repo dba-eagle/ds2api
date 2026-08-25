@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         DS2API 大模型桥接（轮次标识版）
+// @name         DS2API 大模型桥接（轮次标识版 - 布局优化版）
 // @namespace    ds2api
-// @version      2.8
-// @description  自动监控 prompt，显示轮次/时间/NEW标记，复制到剪贴板；回复独立输入框回灌
+// @version      3.2.1
+// @description  自动监控 prompt，显示轮次/时间/NEW标记，复制到剪贴板；回复独立输入框回灌。支持最近3轮历史记录展示及粘贴状态追踪；上下文自动滚动到底部；修正粘贴动画关闭逻辑；优化状态栏布局；复制成功/失败显示不同颜色。
 // @author       You
 // @match        https://kimi.moonshot.cn/*
 // @match        https://kimi.ai/*
@@ -48,8 +48,15 @@
     let lastPromptHash = '';
     let autoMonitorInterval = null;
     let isMonitoring = true;
-    let requestCounter = 0;   // 轮次计数器
-    let lastCaptureTime = ''; // 上次捕获时间
+    let requestCounter = 0;
+    let lastCaptureTime = '';
+
+    // 动画定时器变量
+    let newBadgeInterval = null;    // 徽标闪烁
+    let promptBoxTimeout = null;    // 边框恢复
+
+    // 历史记录数组
+    let historyLogs = [];
 
     function hash(str) {
         let h = 0;
@@ -104,6 +111,9 @@
                 <button id="ds2api-toggle" style="flex:1; padding:7px; background:#21262d; color:#8b949e; border:1px solid #30363d; border-radius:8px; cursor:pointer; font-weight:600; font-size:12px;">⏸️ 暂停</button>
             </div>
 
+            <!-- 历史记录状态栏：移动到按钮下方，方便一眼看到 -->
+            <div id="ds2api-status" style="margin-bottom:12px; font-size:12px; min-height:60px; display:flex; flex-direction:column; justify-content:flex-end; gap:2px;">等待操作...</div>
+
             <!-- 上下文显示区 -->
             <div style="margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
                 <div style="display:flex; align-items:center; gap:6px;">
@@ -127,8 +137,6 @@
                 <button id="ds2api-send" style="flex:2; padding:10px; background:#2ea043; color:#fff; border:none; border-radius:10px; cursor:pointer; font-weight:700; font-size:14px; box-shadow:0 2px 8px rgba(46,160,67,0.3);">🚀 回灌到 ds2api</button>
                 <button id="ds2api-clear-reply" style="flex:1; padding:10px; background:#21262d; color:#8b949e; border:1px solid #30363d; border-radius:10px; cursor:pointer; font-weight:600; font-size:13px;">🗑️ 清空回复</button>
             </div>
-
-            <div id="ds2api-status" style="margin-top:8px; font-size:12px; color:#8b949e; min-height:18px;">等待操作...</div>
         `;
 
         document.body.appendChild(panel);
@@ -152,12 +160,36 @@
         el.style.color = s.text;
     }
 
-    function setStatus(msg, type) {
+    function getLogColor(type) {
+        const colors = { info: '#8b949e', success: '#3fb950', error: '#f85149', warn: '#d29922', active: '#bc8cff' };
+        return colors[type] || colors.info;
+    }
+
+    function renderHistory() {
         const el = document.getElementById('ds2api-status');
         if (!el) return;
-        const colors = { info: '#8b949e', success: '#3fb950', error: '#f85149', warn: '#d29922', active: '#bc8cff' };
-        el.style.color = colors[type] || colors.info;
-        el.textContent = msg;
+
+        let html = '';
+        historyLogs.forEach(log => {
+            const color = getLogColor(log.type);
+            const pasteIcon = log.isPasted ? '<span style="color:#58a6ff; margin-left:4px; font-weight:bold;">[📋 已粘贴]</span>' : '';
+            html += `<div style="color:${color}; margin-bottom:4px; line-height:1.4;">${log.msg}${pasteIcon}</div>`;
+        });
+
+        el.innerHTML = html;
+    }
+
+    function setStatus(msg, type) {
+        historyLogs.push({
+            msg: msg,
+            type: type,
+            isPasted: false,
+            timestamp: Date.now()
+        });
+        if (historyLogs.length > 3) {
+            historyLogs.shift();
+        }
+        renderHistory();
     }
 
     function updateMonitorBadge() {
@@ -179,7 +211,7 @@
             meta.textContent = '等待中...';
             meta.style.color = '#484f58';
         } else {
-            meta.innerHTML = `<span style="color:#58a6ff; font-weight:700;">第 ${requestCounter} 轮</span> <span style="color:#6e7681;">|</span> ${lastCaptureTime} <span style="color:#6e7681;">|</span> <span id="ds2api-prompt-char-count" style="color:#484f58;">0 字符</span>`;
+            meta.innerHTML = `<span style="color:#58a6ff; font-weight:700;">第 ${requestCounter} 轮</span> <span style="color:#6e7681;">|</span> ${lastCaptureTime} <span style="color:#6e7681;">|</span> <span id="ds2api-prompt-char-count" style="color:#8b949e;">0 字符</span>`;
             meta.style.color = '#8b949e';
         }
     }
@@ -189,31 +221,64 @@
         if (el) el.textContent = `${len} 字符`;
     }
 
-    function showNewBadge() {
+    // 核心：清除所有动画和NEW标记
+    function clearNewIndicators() {
+        if (newBadgeInterval) {
+            clearInterval(newBadgeInterval);
+            newBadgeInterval = null;
+        }
+        const badge = document.getElementById('ds2api-req-badge');
+        if (badge) {
+            badge.style.display = 'none';
+            badge.style.opacity = '1';
+        }
+
+        if (promptBoxTimeout) {
+            clearTimeout(promptBoxTimeout);
+            promptBoxTimeout = null;
+        }
+        const box = document.getElementById('ds2api-prompt-box');
+        if (box) {
+            box.style.borderColor = '#30363d';
+            box.style.boxShadow = 'none';
+        }
+    }
+
+    // 修改：支持按颜色显示 NEW 徽标（成功/失败）
+    function showNewBadge(bgColor) {
+        clearNewIndicators();
         const badge = document.getElementById('ds2api-req-badge');
         if (!badge) return;
+
+        badge.style.background = bgColor;
         badge.style.display = 'inline-block';
         let flashes = 0;
-        const interval = setInterval(() => {
+        newBadgeInterval = setInterval(() => {
             badge.style.opacity = flashes % 2 === 0 ? '1' : '0.3';
             flashes++;
             if (flashes >= 6) {
-                clearInterval(interval);
+                clearInterval(newBadgeInterval);
+                newBadgeInterval = null;
                 badge.style.opacity = '1';
-                setTimeout(() => { badge.style.display = 'none'; }, 3000);
             }
         }, 400);
     }
 
-    function flashPromptBox() {
+    // 修改：支持按颜色显示边框高亮（成功/失败）
+    function flashPromptBox(color) {
+        if (promptBoxTimeout) clearTimeout(promptBoxTimeout);
         const box = document.getElementById('ds2api-prompt-box');
         if (!box) return;
-        box.style.borderColor = '#2ea043';
-        box.style.boxShadow = '0 0 16px #2ea04360';
-        setTimeout(() => { box.style.borderColor = '#30363d'; box.style.boxShadow = 'none'; }, 1500);
+
+        box.style.borderColor = color;
+        box.style.boxShadow = `0 0 16px ${color}99`;
+        promptBoxTimeout = setTimeout(() => {
+            box.style.borderColor = '#30363d';
+            box.style.boxShadow = 'none';
+            promptBoxTimeout = null;
+        }, 1500);
     }
 
-    // 双保险复制
     async function copyToClipboard(text) {
         let ok = false;
         if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -232,7 +297,6 @@
         return ok;
     }
 
-    // ========== 核心：自动监控 prompt 更新 ==========
     function checkPromptUpdate() {
         if (!isMonitoring) return;
         GM_xmlhttpRequest({
@@ -243,27 +307,32 @@
                 if (!text || text.length < 10) return;
 
                 const h = hash(text);
-                if (h === lastPromptHash) return; // 没变，跳过
+                if (h === lastPromptHash) return;
 
-                // === 新请求 detected ===
+                // 关键：先更新 lastPromptHash，确保不会重复触发本轮
                 lastPromptHash = h;
                 requestCounter++;
                 lastCaptureTime = formatTime();
 
                 const box = document.getElementById('ds2api-prompt-box');
                 box.value = text;
+                box.scrollTop = box.scrollHeight;
+
                 updatePromptMeta();
                 updatePromptCharCount(text.length);
-                showNewBadge();
-                flashPromptBox();
 
+                // 先执行复制，再根据结果触发对应颜色的动画
                 copyToClipboard(text).then(copied => {
                     if (copied) {
+                        showNewBadge('#238636');    // 绿色
+                        flashPromptBox('#2ea043');  // 绿色
                         setBanner(`🟢 <b>第 ${requestCounter} 轮新上下文已自动获取并复制！</b> 直接粘贴发送`, 'success');
                         setStatus(`✅ 第 ${requestCounter} 轮 | ${text.length} 字符 | 已复制到剪贴板 | ${lastCaptureTime}`, 'success');
                     } else {
-                        setBanner(`🟡 <b>第 ${requestCounter} 轮新上下文已获取！</b> 浏览器阻止自动复制，请手动选中绿框按 Ctrl+C`, 'warn');
-                        setStatus(`⚠️ 第 ${requestCounter} 轮 | ${text.length} 字符 | 请手动复制 | ${lastCaptureTime}`, 'warn');
+                        showNewBadge('#f85149');    // 红色
+                        flashPromptBox('#f85149');  // 红色
+                        setBanner(`🔴 <b>第 ${requestCounter} 轮新上下文已获取！</b> 浏览器阻止自动复制，请手动选中复制`, 'error');
+                        setStatus(`❌ 第 ${requestCounter} 轮 | ${text.length} 字符 | 自动复制失败 | ${lastCaptureTime}`, 'error');
                     }
                 });
             },
@@ -333,17 +402,19 @@
                         lastCaptureTime = formatTime();
                     }
                     box.value = text;
+                    box.scrollTop = box.scrollHeight;
+
                     updatePromptMeta();
                     updatePromptCharCount(text.length);
-                    if (isNew) { showNewBadge(); flashPromptBox(); }
+                    if (isNew) { showNewBadge('#238636'); flashPromptBox('#2ea043'); }
 
                     copyToClipboard(text).then(copied => {
                         if (copied) {
                             setBanner(`✅ 第 ${requestCounter} 轮已获取并复制！`, 'success');
                             setStatus(`✅ 第 ${requestCounter} 轮 | ${text.length} 字符已复制 | ${lastCaptureTime}`, 'success');
                         } else {
-                            setBanner(`🟡 第 ${requestCounter} 轮已获取！请手动复制`, 'warn');
-                            setStatus(`⚠️ 第 ${requestCounter} 轮 | ${text.length} 字符 | 请手动复制`, 'warn');
+                            setBanner(`🔴 第 ${requestCounter} 轮已获取！请手动复制`, 'error');
+                            setStatus(`❌ 第 ${requestCounter} 轮 | ${text.length} 字符 | 复制失败 | ${lastCaptureTime}`, 'error');
                         }
                     });
                 } else if (res.status === 404) {
@@ -371,7 +442,6 @@
         if (!text) { setStatus('❌ 回复内容为空', 'error'); return; }
         if (text.length < 5) { setStatus('❌ 回复内容太短', 'error'); return; }
 
-        setStatus('⏳ 回灌中...', 'active');
         GM_xmlhttpRequest({
             method: 'POST', url: RECEIVER_URL,
             headers: { 'Content-Type': 'text/plain; charset=utf-8' },
@@ -402,6 +472,14 @@
         });
         document.getElementById('ds2api-reply-box')?.addEventListener('input', function() {
             document.getElementById('ds2api-reply-count').textContent = `${this.value.length} 字符`;
+        });
+
+        document.addEventListener('paste', () => {
+            clearNewIndicators();
+            if (historyLogs.length > 0) {
+                historyLogs[historyLogs.length - 1].isPasted = true;
+                renderHistory();
+            }
         });
     }
 
